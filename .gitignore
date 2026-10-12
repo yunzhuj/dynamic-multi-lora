@@ -227,3 +227,9 @@ ep_kernels_workspace/
 
 # Allow tracked library source folders under submodules (e.g., benchmarks/lib)
 !vllm/benchmarks/lib/
+
+# Dynamic multi-LoRA: downloaded adapters and generated profiles
+loras/
+models/
+results/profiles_*/
+!benchmarks/multi_lora/lora_sources.json

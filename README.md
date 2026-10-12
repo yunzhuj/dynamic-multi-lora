@@ -1,3 +1,138 @@
+# Dynamic Multi-LoRA Serving
+
+A popularity-aware multi-LoRA serving extension of
+[vLLM](https://github.com/vllm-project/vllm). The project merges the
+most-requested LoRA adapter into the base weights so its requests run with
+zero LoRA overhead, serves every other adapter as an exact delta LoRA, and
+switches the merged adapter online with blue-green vLLM profiles when traffic
+shifts.
+
+This repository was developed by Yun Zhu. It preserves the upstream vLLM
+history and Apache-2.0 license; the dynamic multi-LoRA extension is an
+experimental research prototype rather than an official vLLM release.
+
+![Hot change: latency over time with switch markers](results/analysis/hot_change_paper.png)
+
+## What this extension adds
+
+- An offline profile builder that produces, for each candidate hot adapter,
+  a fused base model and exact delta adapters for all other adapters
+  (`benchmarks/dynamic_multi_lora/lora_profile_builder.py`).
+- A sliding-window popularity tracker with threshold, margin, and cooldown
+  guards against thrashing (`benchmarks/dynamic_multi_lora/popularity_tracker.py`).
+- An OpenAI-compatible router and blue-green profile switch manager that
+  spawns, health-checks, promotes, and drains vLLM processes
+  (`benchmarks/dynamic_multi_lora/dynamic_router.py`).
+- Modal A100 experiment drivers for stable skew, hot change, and thrashing
+  workloads, plus vanilla multi-LoRA, static pre-merged, LRU, and 2-adapter
+  control baselines (`benchmarks/dynamic_multi_lora/`, `benchmarks/multi_lora/`).
+- Analysis and plotting scripts, a parameter sensitivity sweep, and recorded
+  results (`results/`).
+
+## Why
+
+Multi-LoRA traffic is highly skewed: a few adapters get most requests. Existing
+systems force a trade-off:
+
+| Approach | Hot adapter | Other adapters |
+|---|---|---|
+| Unmerged multi-LoRA (vLLM, S-LoRA) | pays LoRA overhead on every request | flexible |
+| Static merge (`W + H`) | zero overhead | cannot be served |
+| **This project** | zero overhead (fused `W + H`) | exact, via delta LoRA `C − H` |
+
+The delta trick is exact: `(W + H) + (C − H) = W + C`. For LoRAs
+`C = s_C·B_C·A_C` and `H = s_H·B_H·A_H`, the delta is a rank `r_C + r_H` LoRA
+`[s_C·B_C, −s_H·B_H] · [A_C; A_H]`, which vLLM loads like any other adapter.
+
+## Method
+
+```
+clients ──► DynamicLoRARouter ──► vLLM (active profile)
+            │ sliding-window        fused base W + H      ◄─ hot requests
+            │ popularity tracker    delta LoRAs C − H     ◄─ cold requests
+            │
+            └─ ProfileSwitchManager (blue-green):
+               start profile W + H' → health check → promote → drain & stop old
+```
+
+1. **Offline profile builder** – for every candidate hot adapter `H`, build the
+   fused model `W + H` and a delta adapter `C − H` for every other adapter `C`.
+2. **Popularity tracker** – sliding window over requested adapter IDs. A switch
+   fires only if *all* guards hold: window is large enough, the candidate's share
+   ≥ `merge_threshold`, it leads the current hot adapter by ≥ `switch_margin`,
+   the `cooldown` has elapsed, and no switch is in progress.
+3. **Router** – hot requests go to the fused base (fast path), cold requests to
+   their delta adapter (exact slow path).
+4. **Blue-green switch** – the new profile starts in a separate vLLM process
+   while the old one keeps serving; no in-place weight mutation, no serving gap.
+
+## Quick start
+
+The experiments run against stock vLLM inside Modal containers, so the local
+machine only needs the client-side dependencies:
+
+```bash
+pip install modal torch safetensors huggingface_hub requests numpy tqdm pytest
+python -m pytest benchmarks/dynamic_multi_lora/tests/ -q   # 23 CPU-only tests
+bash scripts/download_loras.sh                             # fetch the three LoRAs into ./loras
+
+modal run benchmarks/dynamic_multi_lora/run_dynamic_multi_lora_on_modal.py
+```
+
+Every experiment and its flags are documented in
+[benchmarks/dynamic_multi_lora/README.md](benchmarks/dynamic_multi_lora/README.md).
+
+## Results
+
+TinyLlama-1.1B-Chat with three LoRAs (`hot_general`, `cold_dummy`,
+`cold_instruct`) on a Modal A100. Full tables: [results/analysis/summary.md](results/analysis/summary.md).
+
+**Stable skew** – dynamic serving tracks the static pre-merged oracle and beats
+vanilla vLLM multi-LoRA at every hot ratio.
+
+| hot ratio | vanilla multi-LoRA | static oracle | dynamic |
+|---|---|---|---|
+| 0.4 | 453 ms · 2.21 req/s | 214 ms · 4.66 req/s | 189 ms · 5.30 req/s |
+| 0.8 | 335 ms · 2.98 req/s | 144 ms · 6.94 req/s | 147 ms · 6.79 req/s |
+| 1.0 | 288 ms · 3.47 req/s | 116 ms · 8.61 req/s | 103 ms · 9.67 req/s |
+
+![Stable skew](results/analysis/stable_skew_paper.png)
+
+**Hot change** (`hot_general` → `cold_dummy`) – the router detects the shift and
+promotes the new profile; after the switch, latency is **2.19× lower** than
+vanilla multi-LoRA (empty-completion-filtered means). Blue-green switch overhead
+(decided → committed) is ~155 s, during which the old profile keeps serving.
+
+**Thrashing** – under alternating traffic the guarded policy commits **0**
+switches vs **3** for a naive policy (on a 1500-request replay sweep: 0 vs 19).
+
+![Thrashing](results/analysis/thrashing.png)
+
+**Caveats.** At `hot_ratio = 0` part of the dynamic-vs-vanilla gap comes from
+vanilla serving three adapters instead of two; a 2-adapter control attributes
+~14% of that gap to adapter count. TinyLlama emits zero-token completions on a
+share of requests, so per-segment means are also reported with those filtered.
+See [results/NOTES.md](results/NOTES.md).
+
+## Limitations
+
+- One full fused model per candidate hot adapter on disk.
+- During a switch two vLLM processes share the GPU, and the new one pays
+  vLLM startup time.
+- Delta adapters have rank `r_C + r_H`, so cold requests are slightly more
+  expensive than with the original adapter.
+
+## Repository hygiene
+
+Model weights, LoRA adapters, generated profiles, caches, and logs are
+intentionally excluded from version control. Adapters are downloaded from
+Hugging Face by `scripts/download_loras.sh`, and profiles are rebuilt by the
+experiment drivers.
+
+---
+
+# Upstream vLLM
+
 <!-- markdownlint-disable MD001 MD041 -->
 <p align="center">
   <picture>
